@@ -1,32 +1,191 @@
-# Prerequisites
-*.d
+#define OPENSSL_API_COMPAT 0x10100000L
+#include <iostream>
+#include <string>
+#include <vector>
+#include <bitset>
+#include <openssl/sha.h>
+#include <openssl/ripemd.h>
+#include <openssl/ec.h>
+#include <openssl/obj_mac.h>
+#include <iomanip>
+#include <sstream>
+#include <locale>
+#include <codecvt>
+#include <algorithm>
+#include <random>
+#include <chrono>
+#include <numeric>
+#include <fstream>  // Для работы с файлами
 
-# Compiled Object files
-*.slo
-*.lo
-*.o
-*.obj
+const std::string BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
-# Precompiled Headers
-*.gch
-*.pch
+// Функция для кодирования в формате Base58
+std::string encodeBase58(const std::vector<unsigned char>& input) {
+    std::string result;
+    uint64_t carry;
+    int zeroes = 0;
 
-# Compiled Dynamic libraries
-*.so
-*.dylib
-*.dll
+    for (auto i : input) {
+        if (i == 0) {
+            zeroes++;
+        }
+        else {
+            break;
+        }
+    }
 
-# Fortran module files
-*.mod
-*.smod
+    std::vector<unsigned char> temp(input.begin(), input.end());
+    while (!temp.empty()) {
+        carry = 0;
+        for (auto& byte : temp) {
+            carry = (carry << 8) + byte;
+            byte = static_cast<unsigned char>(carry / 58);
+            carry %= 58;
+        }
 
-# Compiled Static libraries
-*.lai
-*.la
-*.a
-*.lib
+        while (!temp.empty() && temp[0] == 0) {
+            temp.erase(temp.begin());
+        }
+        result += BASE58_ALPHABET[carry];
+    }
 
-# Executables
-*.exe
-*.out
-*.app
+    for (int i = 0; i < zeroes; ++i) {
+        result += BASE58_ALPHABET[0];
+    }
+
+    std::reverse(result.begin(), result.end());
+    return result;
+}
+
+// Функция для генерации биткойн-адреса из публичного ключа
+std::string generateBitcoinAddress(const std::vector<unsigned char>& publicKey) {
+    unsigned char sha256Hash[SHA256_DIGEST_LENGTH];
+    SHA256(publicKey.data(), publicKey.size(), sha256Hash);
+
+    unsigned char ripemd160Hash[RIPEMD160_DIGEST_LENGTH];
+    RIPEMD160(sha256Hash, SHA256_DIGEST_LENGTH, ripemd160Hash);
+
+    std::vector<unsigned char> versionedHash = { 0x00 };  // Используем 0x00 для основного адреса Bitcoin
+    versionedHash.insert(versionedHash.end(), ripemd160Hash, ripemd160Hash + RIPEMD160_DIGEST_LENGTH);
+
+    unsigned char checksum[SHA256_DIGEST_LENGTH];
+    SHA256(versionedHash.data(), versionedHash.size(), checksum);
+    SHA256(checksum, SHA256_DIGEST_LENGTH, checksum);
+
+    versionedHash.insert(versionedHash.end(), checksum, checksum + 4);
+
+    return encodeBase58(versionedHash);
+}
+
+// Функция для преобразования 67-битного ключа в 256-битный формат
+std::vector<unsigned char> bitsetTo256BitVector(const std::bitset<67>& bits) {
+    std::vector<unsigned char> privKeyBytes(32, 0);  // 256 бит = 32 байта
+
+    std::string bitString = bits.to_string();
+    int offset = 256 - 67;  // Дополняем 67-битный ключ до 256 бит
+
+    for (size_t i = 0; i < 67; ++i) {
+        privKeyBytes[offset / 8] <<= 1;
+        privKeyBytes[offset / 8] |= bitString[i] - '0';
+        offset++;
+    }
+
+    return privKeyBytes;
+}
+
+// Функция для генерации сжатого публичного ключа из приватного ключа
+std::vector<unsigned char> generateCompressedPublicKeyFromPrivateKey(const std::vector<unsigned char>& privKeyBytes) {
+    BIGNUM* privKeyBn = BN_bin2bn(privKeyBytes.data(), privKeyBytes.size(), nullptr);
+
+    EC_GROUP* curve = EC_GROUP_new_by_curve_name(NID_secp256k1);
+    EC_KEY* ecKey = EC_KEY_new();
+    EC_KEY_set_group(ecKey, curve);
+    EC_KEY_set_private_key(ecKey, privKeyBn);
+
+    EC_POINT* pubKey = EC_POINT_new(curve);
+    EC_POINT_mul(curve, pubKey, privKeyBn, nullptr, nullptr, nullptr);
+    EC_KEY_set_public_key(ecKey, pubKey);
+
+    std::vector<unsigned char> publicKey(33);  // Для сжатого ключа размер 33 байта
+
+    // Получаем координаты x и y
+    BIGNUM* x = BN_new();
+    BIGNUM* y = BN_new();
+    EC_POINT_get_affine_coordinates_GFp(curve, pubKey, x, y, nullptr);
+
+    // Устанавливаем первый байт: 0x02 если y чётное, 0x03 если y нечётное
+    publicKey[0] = (BN_is_odd(y) ? 0x03 : 0x02);
+
+    // Копируем координату x в оставшиеся 32 байта
+    BN_bn2binpad(x, publicKey.data() + 1, 32);
+
+    // Очистка
+    BN_free(x);
+    BN_free(y);
+    BN_free(privKeyBn);
+    EC_POINT_free(pubKey);
+    EC_KEY_free(ecKey);
+    EC_GROUP_free(curve);
+
+    return publicKey;
+}
+
+// Функция для проверки адреса на совпадение с целевым
+bool checkAddress(const std::string& address, const std::string& target) {
+    return address == target;
+}
+
+// Функция для генерации случайных комбинаций битов
+void generateRandomKeysAndCheckAddress(const std::string& targetAddress) {
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<> dis(0, 65);
+
+    while (true) {  // Бесконечный цикл
+        std::bitset<67> privateKeyBits;
+        privateKeyBits.set(66); // Фиксируем самый старший бит в 1
+
+        std::vector<int> positions(66);
+        std::iota(positions.begin(), positions.end(), 0); // Позиции от 0 до 65
+        std::shuffle(positions.begin(), positions.end(), gen);
+
+        for (int i = 0; i < 32; ++i) {
+            privateKeyBits.set(positions[i]);
+        }
+
+        std::vector<unsigned char> privKeyBytes = bitsetTo256BitVector(privateKeyBits);
+        std::vector<unsigned char> publicKey = generateCompressedPublicKeyFromPrivateKey(privKeyBytes);
+
+        std::string address = generateBitcoinAddress(publicKey);
+
+        std::wcout << L"Приватный ключ (67 бит): " << privateKeyBits << L" -> Адрес: " << std::wstring(address.begin(), address.end()) << std::endl;
+
+        if (checkAddress(address, targetAddress)) {
+            std::wcout << L"Найденный адрес: " << std::wstring(address.begin(), address.end()) << std::endl;
+
+            // Сохранение ключа и адреса в файл
+            std::ofstream outfile("сисечки.txt", std::ios::app);  // Открываем файл для добавления
+            if (outfile.is_open()) {
+                // Записываем приватный ключ и адрес
+                outfile << "Приватный ключ (67 бит): " << privateKeyBits << " -> Адрес: " << address << std::endl;
+                outfile.close();
+                std::wcout << L"Ключ и адрес сохранены в файл 'сисечки.txt'." << std::endl;
+            }
+            else {
+                std::cerr << "Ошибка при открытии файла для записи." << std::endl;
+            }
+            break;  // Выход из цикла при нахождении адреса
+        }
+    }
+}
+
+int main() {
+    setlocale(LC_ALL, "ru_RU.UTF-8");
+    std::wcout.imbue(std::locale("ru_RU.UTF-8"));
+
+    std::string targetAddress = "1BY8GQbnueYofwSuFAT3USAhGjPrkxDdW9";
+    std::wcout << L"Запуск генерации случайных ключей и адресов для проверки..." << std::endl;
+    generateRandomKeysAndCheckAddress(targetAddress);
+    std::wcout << L"Процесс завершен." << std::endl;
+    return 0;
+}
