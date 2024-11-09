@@ -16,7 +16,7 @@
 #include <chrono>
 #include <numeric>
 #include <fstream>  // Для работы с файлами
-
+#include <openssl/bn.h>
 const std::string BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
 // Функция для кодирования в формате Base58
